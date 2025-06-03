@@ -280,7 +280,7 @@ async def check_role_expirations():
                     member = guild.get_member(user_id)
                     if member:
                         await notification_channel.send(
-                            f"{member.mention}, role {role_name} của bạn còn {formatted_time}, vui lòng nhớ gia hạn!"
+                            f"Này {member.mention}, bạn chỉ còn {formatted_time} để xem sếch thôi, nhớ gia hạn nhé!"
                         )
                         role_timers_collection.update_one(
                             {"user_id": user_id, "role_name": role_name},
