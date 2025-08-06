@@ -10,7 +10,6 @@ import uuid
 import io
 import aiohttp
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
@@ -32,9 +31,10 @@ ROLE_NOTIFICATION_CHANNEL_ID = int(os.getenv("ROLE_NOTIFICATION_CHANNEL_ID", 0))
 FILE_CATEGORY_ID = int(os.getenv("FILE_CATEGORY_ID", 0))  # ID danh mục cho kênh tạm thời
 ROLE_DURATION_DAYS = int(os.getenv("ROLE_DURATION_DAYS", 50))
 NOTIFICATION_THRESHOLD_DAYS = int(os.getenv("NOTIFICATION_THRESHOLD_DAYS", 5))
-GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")  # ID thư mục Google Drive (tùy chọn)
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 # Thiết lập bot Discord, vô hiệu hóa lệnh help mặc định
 intents = discord.Intents.default()
@@ -61,24 +61,16 @@ except Exception as e:
 # Thiết lập Google Drive API
 SCOPES = ['https://www.googleapis.com/auth/drive']
 creds = None
-if os.path.exists('token.json'):
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-if not creds or not creds.valid:
-    # Lấy nội dung credentials từ biến môi trường
-    credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if not credentials_json:
-        raise Exception("Không tìm thấy GOOGLE_CREDENTIALS_JSON trong biến môi trường!")
-    
-    # Tạo file tạm thời từ nội dung JSON
-    with open('temp_credentials.json', 'w') as temp_file:
-        temp_file.write(credentials_json)
-    
-    flow = InstalledAppFlow.from_client_secrets_file('temp_credentials.json', SCOPES)
-    creds = flow.run_local_server(port=0)
-    with open('token.json', 'w') as token:
-        token.write(creds.to_json())
-    # Xóa file tạm thời
-    os.remove('temp_credentials.json')
+if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REFRESH_TOKEN:
+    raise Exception("Thiếu GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET hoặc GOOGLE_REFRESH_TOKEN trong biến môi trường!")
+creds = Credentials(
+    token=None,  # Access token sẽ được làm mới tự động
+    refresh_token=GOOGLE_REFRESH_TOKEN,
+    token_uri="https://oauth2.googleapis.com/token",
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    scopes=SCOPES
+)
 drive_service = build('drive', 'v3', credentials=creds)
 
 # Ánh xạ role
@@ -218,187 +210,102 @@ async def on_ready():
     for record in role_timers_collection.find():
         user_id = record["user_id"]
         role_name = record["role_name"]
-        expiration_time = record["expiration_time"]
-        if expiration_time > datetime.utcnow():
-            key = f"{user_id}_{role_name}"
-            if key not in active_tasks:
-                member = guild.get_member(user_id)
-                role = discord.utils.get(guild.roles, name=role_name)
-                if member and role and role in member.roles:
-                    task = asyncio.create_task(remove_role_after_delay(member, role, user_id, role_name))
-                    active_tasks[key] = task
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        role = discord.utils.get(guild.roles, name=role_mapping.get(role_name, role_name))
+        if role and role in member.roles:
+            if user_id not in active_tasks:
+                active_tasks[user_id] = []
+            active_tasks[user_id].append(
+                bot.loop.create_task(remove_role_after_delay(member, role, user_id, role_name))
+            )
     check_role_expirations.start()
 
-@bot.event
-async def on_guild_remove(guild):
-    """Xử lý khi bot rời server."""
-    role_timers_collection.delete_many({"guild_id": guild.id})
-    role_history_collection.delete_many({"guild_id": guild.id})
-    file_uploads_collection.delete_many({"guild_id": guild.id})
-    download_history_collection.delete_many({"guild_id": guild.id})
-    logger.info(f"Bot đã rời server {guild.name} ({guild.id}), dọn dẹp dữ liệu MongoDB.")
-
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ADMIN_ROLES))
-async def giahan(ctx):
+async def giahan(ctx, member: discord.Member):
     """Gia hạn hoặc cấp mới role xem sếch cho người dùng."""
-    if len(ctx.message.mentions) != 1:
-        await ctx.send(f"{ctx.author.mention}, vui lòng mention đúng một người!")
-        return
-    user = ctx.message.mentions[0]
-    role_name = role_mapping[TIMED_ROLE_KEY]
-    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    role = discord.utils.get(ctx.guild.roles, name=role_mapping[TIMED_ROLE_KEY])
     if not role:
-        await ctx.send(f"{ctx.author.mention}, role {role_name} chưa được tạo, vui lòng nhờ Admin tạo role!")
+        await ctx.send(f"{ctx.author.mention}, role '{role_mapping[TIMED_ROLE_KEY]}' không tồn tại trong server!")
         return
-    if not ctx.guild.me.guild_permissions.manage_roles:
-        await ctx.send(f"{ctx.author.mention}, bot không có quyền Manage Roles! Vui lòng cấp quyền cho bot.")
-        return
-    if role.position >= ctx.guild.me.top_role.position:
-        await ctx.send(f"{ctx.author.mention}, role {role_name} có thứ tự cao hơn role của bot! Vui lòng điều chỉnh thứ tự role.")
-        return
-
-    set_time = datetime.utcnow()
-    record = role_timers_collection.find_one({"user_id": user.id, "role_name": role_name})
-    if record and record["expiration_time"] > set_time:
-        new_expiration_time = record["expiration_time"] + timedelta(days=ROLE_DURATION_DAYS)
-        role_timers_collection.update_one(
-            {"user_id": user.id, "role_name": role_name},
-            {"$set": {
-                "expiration_time": new_expiration_time,
-                "last_notified": None
-            }}
-        )
-        role_history_collection.insert_one({
-            "user_id": user.id,
-            "role_name": role_name,
-            "set_time": set_time,
-            "expiration_time": new_expiration_time,
-            "action": "gia_han",
-            "guild_id": ctx.guild.id
-        })
-        remaining_time = format_remaining_time(new_expiration_time)
-        await ctx.send(f"{user.mention}, thời gian xem sếch đã được gia hạn thêm {ROLE_DURATION_DAYS} ngày, còn {remaining_time}!")
-        notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
-        if notification_channel:
-            await notification_channel.send(
-                f"Gia hạn role cho {user.mention} vào {set_time.strftime('%H:%M %d/%m/%Y UTC')} "
-                f"với thời gian còn lại là {remaining_time}"
-            )
-    else:
-        try:
-            await user.add_roles(role)
-            logger.info(f"Đã cấp role {role_name} cho {user.id}")
-        except Exception as e:
-            logger.error(f"Lỗi khi cấp role {role_name} cho {user.id}: {e}")
-            await ctx.send(f"{ctx.author.mention}, không thể cấp role {role_name} cho {user.mention} do lỗi: {str(e)}")
-            return
-        expiration_time = set_time + timedelta(days=ROLE_DURATION_DAYS)
-        role_timers_collection.update_one(
-            {"user_id": user.id, "role_name": role_name},
-            {"$set": {
-                "set_time": set_time,
+    expiration_time = datetime.utcnow() + timedelta(days=ROLE_DURATION_DAYS)
+    role_timers_collection.update_one(
+        {"user_id": member.id, "role_name": TIMED_ROLE_KEY},
+        {
+            "$set": {
                 "expiration_time": expiration_time,
-                "last_notified": None,
-                "guild_id": ctx.guild.id
-            }},
-            upsert=True
-        )
-        role_history_collection.insert_one({
-            "user_id": user.id,
-            "role_name": role_name,
-            "set_time": set_time,
-            "expiration_time": expiration_time,
-            "action": "cap_moi",
-            "guild_id": ctx.guild.id
-        })
-        remaining_time = format_remaining_time(expiration_time)
-        await ctx.send(f"{user.mention}, bạn đã được cấp role xem sếch trong {ROLE_DURATION_DAYS} ngày!")
-        notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
-        if notification_channel:
-            await notification_channel.send(
-                f"Cấp role cho {user.mention} vào {set_time.strftime('%H:%M %d/%m/%Y UTC')} "
-                f"với thời gian còn lại là {remaining_time}"
-            )
-
-    asyncio.create_task(remove_role_after_delay(user, role, user.id, role_name))
+                "last_notified": None
+            }
+        },
+        upsert=True
+    )
+    role_history_collection.insert_one({
+        "user_id": member.id,
+        "user_name": member.name,
+        "role_name": TIMED_ROLE_KEY,
+        "action": "giahan",
+        "timestamp": datetime.utcnow(),
+        "admin_id": ctx.author.id,
+        "admin_name": ctx.author.name
+    })
+    await member.add_roles(role)
+    await ctx.send(f"{ctx.author.mention}, đã gia hạn role '{role_mapping[TIMED_ROLE_KEY]}' cho {member.mention} đến {expiration_time.strftime('%H:%M %d/%m/%Y UTC')}.")
+    bot.loop.create_task(remove_role_after_delay(member, role, member.id, TIMED_ROLE_KEY))
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ADMIN_ROLES))
-async def rm(ctx):
+async def rm(ctx, member: discord.Member):
     """Gỡ role xem sếch khỏi người dùng."""
-    if len(ctx.message.mentions) != 1:
-        await ctx.send(f"{ctx.author.mention}, vui lòng mention đúng một người!")
-        return
-    user = ctx.message.mentions[0]
-    role_name = role_mapping[TIMED_ROLE_KEY]
-    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    role = discord.utils.get(ctx.guild.roles, name=role_mapping[TIMED_ROLE_KEY])
     if not role:
-        await ctx.send(f"{ctx.author.mention}, role {role_name} chưa được tạo, vui lòng nhờ Admin tạo role!")
+        await ctx.send(f"{ctx.author.mention}, role '{role_mapping[TIMED_ROLE_KEY]}' không tồn tại trong server!")
         return
-    if not ctx.guild.me.guild_permissions.manage_roles:
-        await ctx.send(f"{ctx.author.mention}, bot không có quyền Manage Roles! Vui lòng cấp quyền cho bot.")
-        return
-    if role.position >= ctx.guild.me.top_role.position:
-        await ctx.send(f"{ctx.author.mention}, role {role_name} có thứ tự cao hơn role của bot! Vui lòng điều chỉnh thứ tự role.")
-        return
-    if role in user.roles:
-        try:
-            await user.remove_roles(role)
-            role_timers_collection.delete_one({"user_id": user.id, "role_name": role_name})
-            await ctx.send(f"{ctx.author.mention}, đã gỡ role {role_name} khỏi {user.mention}!")
-            notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
-            if notification_channel:
-                await notification_channel.send(f"{user.mention}, role xem sếch của bạn đã bị gỡ, vui lòng liên hệ Admin!")
-            logger.info(f"Đã gỡ role {role_name} khỏi {user.id}")
-        except Exception as e:
-            logger.error(f"Lỗi khi gỡ role {role_name} cho {user.id}: {e}")
-            await ctx.send(f"{ctx.author.mention}, không thể gỡ role {role_name} khỏi {user.mention} do lỗi: {str(e)}")
-    else:
-        await ctx.send(f"{ctx.author.mention}, {user.mention} không có role {role_name} để gỡ!")
+    role_timers_collection.delete_one({"user_id": member.id, "role_name": TIMED_ROLE_KEY})
+    role_history_collection.insert_one({
+        "user_id": member.id,
+        "user_name": member.name,
+        "role_name": TIMED_ROLE_KEY,
+        "action": "remove",
+        "timestamp": datetime.utcnow(),
+        "admin_id": ctx.author.id,
+        "admin_name": ctx.author.name
+    })
+    await member.remove_roles(role)
+    await ctx.send(f"{ctx.author.mention}, đã gỡ role '{role_mapping[TIMED_ROLE_KEY]}' khỏi {member.mention}.")
 
 @bot.command()
-async def check(ctx, user: discord.Member = None):
-    """Kiểm tra thời gian role xem sếch của bản thân hoặc người khác (Admin/Mod/Friendly Dev)."""
-    if user is None:
-        user = ctx.author
-    else:
-        if not has_role(ctx.author, ADMIN_ROLES):
-            await ctx.send(f"{ctx.author.mention}, bạn không có quyền kiểm tra thời gian của người khác! Hãy dùng `$check` để kiểm tra thời gian của chính bạn.")
-            return
-    role_name = role_mapping[TIMED_ROLE_KEY]
-    record = role_timers_collection.find_one({"user_id": user.id, "role_name": role_name})
-    if record and record["expiration_time"] > datetime.utcnow():
-        expiration_time = record["expiration_time"]
-        remaining = format_remaining_time(expiration_time)
-        await ctx.send(f"{user.mention} còn {remaining} để xem sếch!")
-    else:
-        await ctx.send(f"{user.mention} chưa có role xem sếch, vui lòng nạp VIP lên mâm 1 để có thể coi sếch!")
+async def check(ctx, member: discord.Member = None):
+    """Kiểm tra thời gian role xem sếch."""
+    if member is None:
+        member = ctx.author
+    if member != ctx.author and not has_role(ctx.author, ADMIN_ROLES):
+        await ctx.send(f"{ctx.author.mention}, bạn chỉ có thể kiểm tra thời gian role của chính mình!")
+        return
+    record = role_timers_collection.find_one({"user_id": member.id, "role_name": TIMED_ROLE_KEY})
+    if not record:
+        await ctx.send(f"{ctx.author.mention}, {member.mention} không có role '{role_mapping[TIMED_ROLE_KEY]}' hoặc role đã hết hạn!")
+        return
+    formatted_time = format_remaining_time(record["expiration_time"])
+    await ctx.send(f"{ctx.author.mention}, thời gian còn lại của role '{role_mapping[TIMED_ROLE_KEY]}' cho {member.mention}: {formatted_time}.")
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ADMIN_ROLES))
-async def log(ctx, user: discord.Member = None):
-    """Kiểm tra lịch sử gia hạn role của người dùng."""
-    if user is None:
-        await ctx.send(f"{ctx.author.mention}, vui lòng mention một người để kiểm tra lịch sử gia hạn!")
+async def log(ctx, member: discord.Member):
+    """Xem lịch sử gia hạn role xem sếch."""
+    history = role_history_collection.find({"user_id": member.id}).sort("timestamp", -1)
+    history_list = list(history)[:10]
+    if not history_list:
+        await ctx.send(f"{ctx.author.mention}, không tìm thấy lịch sử gia hạn cho {member.mention}!")
         return
-    role_name = role_mapping[TIMED_ROLE_KEY]
-    history = role_history_collection.find({"user_id": user.id, "role_name": role_name}).sort("set_time", 1)
-    history_list = []
-    for record in history:
-        set_time = record["set_time"].strftime('%H:%M %d/%m/%Y UTC')
-        expiration_time = record["expiration_time"].strftime('%H:%M %d/%m/%Y UTC')
-        action = "Cấp mới" if record["action"] == "cap_moi" else "Gia hạn"
-        history_list.append(f"- {action} vào {set_time}, hết hạn vào {expiration_time}")
-    if history_list:
-        await ctx.send(f"Lịch sử gia hạn role {role_name} của {user.mention}:\n" + "\n".join(history_list))
-    else:
-        await ctx.send(f"{user.mention} chưa có lịch sử gia hạn role {role_name}!")
+    response = [f"- {record['action']} bởi <@{record['admin_id']}> ({record['admin_name']}) lúc {record['timestamp'].strftime('%H:%M %d/%m/%Y UTC')}" for record in history_list]
+    await ctx.send(f"Lịch sử gia hạn role '{role_mapping[TIMED_ROLE_KEY]}' của {member.mention}:\n" + "\n".join(response))
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ADMIN_ROLES))
 async def upload(ctx):
-    """Upload file zip/rar lên Google Drive (Admin/Mod/Friendly Dev)."""
+    """Upload file zip/rar lên Google Drive."""
     if not ctx.message.attachments:
         await ctx.send(f"{ctx.author.mention}, vui lòng đính kèm một file zip hoặc rar!")
         return
@@ -406,44 +313,44 @@ async def upload(ctx):
     if not attachment.filename.lower().endswith(('.zip', '.rar')):
         await ctx.send(f"{ctx.author.mention}, chỉ hỗ trợ file zip hoặc rar!")
         return
-    if attachment.size > 100 * 1024 * 1024:  # 100MB
-        await ctx.send(f"{ctx.author.mention}, file quá lớn (>100MB)! Vui lòng chia nhỏ file.")
-        return
-
     await ctx.send(f"{ctx.author.mention}, đang upload file lên Google Drive...")
-    file_data = await attachment.read()
-    file_id, drive_link = await upload_to_drive(file_data, attachment.filename)
-    if not file_id:
-        await ctx.send(f"{ctx.author.mention}, lỗi khi upload file! Kiểm tra DRIVE_FOLDER_ID hoặc quyền thư mục Google Drive.")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(attachment.url) as resp:
+            if resp.status != 200:
+                await ctx.send(f"{ctx.author.mention}, lỗi khi tải file từ Discord!")
+                return
+            file_data = await resp.read()
+    file_id = str(uuid.uuid4())
+    drive_file_id, drive_link = await upload_to_drive(file_data, attachment.filename)
+    if not drive_file_id:
+        await ctx.send(f"{ctx.author.mention}, lỗi khi upload file lên Google Drive!")
         return
-
-    unique_file_id = str(uuid.uuid4())
     file_uploads_collection.insert_one({
-        "file_id": unique_file_id,
+        "file_id": file_id,
         "file_name": attachment.filename,
-        "upload_time": datetime.utcnow(),
+        "drive_file_id": drive_file_id,
         "drive_link": drive_link,
         "uploader_id": ctx.author.id,
-        "guild_id": ctx.guild.id,
-        "drive_file_id": file_id  # Lưu ID file trên Google Drive
+        "uploader_name": ctx.author.name,
+        "upload_time": datetime.utcnow(),
+        "guild_id": ctx.guild.id
     })
-    await ctx.send(
-        f"{ctx.author.mention}, upload thành công!\n"
-        f"Tên tệp: {attachment.filename}\n"
-        f"File ID: {unique_file_id}\n"
-        f"Link Drive: {drive_link}"
-    )
+    await ctx.send(f"{ctx.author.mention}, file đã được upload! File ID: `{file_id}`\nLink Drive: {drive_link}")
 
 @bot.command()
 async def get(ctx, *, file_name):
-    """Tra cứu file_id dựa trên tên tệp."""
-    files = file_uploads_collection.find({"$text": {"$search": file_name}})
-    file_list = list(files)
-    if not file_list:
-        await ctx.send(f"{ctx.author.mention}, không tìm thấy tệp nào khớp với '{file_name}'!")
-        return
-    response = [f"- {file['file_name']} (ID: {file['file_id']})" for file in file_list]
-    await ctx.send(f"Kết quả tìm kiếm cho '{file_name}':\n" + "\n".join(response[:25]))
+    """Tìm file_id theo tên tệp."""
+    try:
+        files = file_uploads_collection.find({"$text": {"$search": f"\"{file_name}\""}}).sort("upload_time", -1)
+        file_list = list(files)[:25]
+        if not file_list:
+            await ctx.send(f"{ctx.author.mention}, không tìm thấy tệp nào khớp với '{file_name}'!")
+            return
+        response = [f"- {file['file_name']} (ID: {file['file_id']})" for file in file_list]
+        await ctx.send(f"Kết quả tìm kiếm cho '{file_name}':\n" + "\n".join(response))
+    except Exception as e:
+        logger.error(f"Lỗi khi thực thi $get: {e}")
+        await ctx.send(f"{ctx.author.mention}, có lỗi xảy ra khi tìm kiếm. Vui lòng kiểm tra log hoặc liên hệ Admin!")
 
 @bot.command()
 async def download(ctx, file_id: str):
@@ -452,7 +359,6 @@ async def download(ctx, file_id: str):
     if not file:
         await ctx.send(f"{ctx.author.mention}, không tìm thấy tệp với ID '{file_id}'!")
         return
-
     category = bot.get_channel(FILE_CATEGORY_ID)
     if not category or not isinstance(category, discord.CategoryChannel):
         await ctx.send(f"{ctx.author.mention}, danh mục kênh không hợp lệ! Vui lòng cấu hình FILE_CATEGORY_ID.")
@@ -460,13 +366,11 @@ async def download(ctx, file_id: str):
     if not ctx.guild.me.guild_permissions.manage_channels:
         await ctx.send(f"{ctx.author.mention}, bot không có quyền Manage Channels! Vui lòng cấp quyền.")
         return
-
     await ctx.send(f"{ctx.author.mention}, đang tải tệp từ Google Drive...")
     file_data = await download_from_drive(file['drive_file_id'])
     if not file_data:
         await ctx.send(f"{ctx.author.mention}, lỗi khi tải tệp từ Google Drive!")
         return
-
     channel = await ctx.guild.create_text_channel(
         name=f"download-{ctx.author.id}-{int(datetime.utcnow().timestamp())}",
         category=category,
