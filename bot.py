@@ -34,6 +34,7 @@ ROLE_DURATION_DAYS = int(os.getenv("ROLE_DURATION_DAYS", 50))
 NOTIFICATION_THRESHOLD_DAYS = int(os.getenv("NOTIFICATION_THRESHOLD_DAYS", 5))
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")  # ID thư mục Google Drive (tùy chọn)
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 # Thiết lập bot Discord, vô hiệu hóa lệnh help mặc định
 intents = discord.Intents.default()
@@ -63,10 +64,21 @@ creds = None
 if os.path.exists('token.json'):
     creds = Credentials.from_authorized_user_file('token.json', SCOPES)
 if not creds or not creds.valid:
-    flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CREDENTIALS_FILE, SCOPES)
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # Lấy nội dung credentials từ biến môi trường
+    credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if not credentials_json:
+        raise Exception("Không tìm thấy GOOGLE_CREDENTIALS_JSON trong biến môi trường!")
+    
+    # Tạo file tạm thời từ nội dung JSON
+    with open('temp_credentials.json', 'w') as temp_file:
+        temp_file.write(credentials_json)
+    
+    flow = InstalledAppFlow.from_client_secrets_file('temp_credentials.json', SCOPES)
+    creds = flow.run_local_server(port=0)
     with open('token.json', 'w') as token:
         token.write(creds.to_json())
+    # Xóa file tạm thời
+    os.remove('temp_credentials.json')
 drive_service = build('drive', 'v3', credentials=creds)
 
 # Ánh xạ role
