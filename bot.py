@@ -5,6 +5,7 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 import logging
 import asyncio
+import re
 from dotenv import load_dotenv
 
 # Cấu hình logging
@@ -42,7 +43,7 @@ except Exception as e:
 
 # Ánh xạ role
 role_mapping = {
-    "giahan_new": "Gia hạn"    # Role chính cho $giahanfn
+    "giahan_new": "Gia hạn"    # Role chính cho $giahan
 }
 TIMED_ROLE_KEY = "giahan_new"  # Role quản lý thời gian
 
@@ -64,22 +65,52 @@ def format_remaining_time(expiration_time):
     minutes = int((total_seconds % 3600) // 60)
     return f"{months} tháng {days} ngày {hours} giờ {minutes} phút"
 
-# Hàm xóa role sau thời gian hết hạn
+# Hàm xóa role sau thời gian hết hạn (cập nhật với logic kiểm tra mới)
 async def remove_role_after_delay(member, role, user_id, role_name):
     try:
+        # Kiểm tra ngay lập tức
         record = role_timers_collection.find_one({"user_id": user_id, "role_name": role_name})
         if record:
-            duration = (record["expiration_time"] - datetime.utcnow()).total_seconds()
-            if duration > 0:
+            expiration_time = record["expiration_time"]
+            remaining = expiration_time - datetime.utcnow()
+            duration = remaining.total_seconds()
+            if duration <= 0:
+                # Hết hạn ngay, xóa
+                await member.remove_roles(role)
+                role_timers_collection.delete_one({"user_id": user_id, "role_name": role_name})
+                channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
+                if channel:
+                    await channel.send(f"{member.mention}, bạn đã hết giờ xem sếch, vui lòng liên hệ Admin!")
+                return
+            else:
+                # Sleep đến hết hạn
                 await asyncio.sleep(duration)
-                try:
+                
+                # Sau sleep, kiểm tra lại DB
+                new_record = role_timers_collection.find_one({"user_id": user_id, "role_name": role_name})
+                if not new_record or new_record["expiration_time"] <= datetime.utcnow():
+                    # Vẫn hết hạn, xóa
                     await member.remove_roles(role)
                     role_timers_collection.delete_one({"user_id": user_id, "role_name": role_name})
                     channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
                     if channel:
                         await channel.send(f"{member.mention}, bạn đã hết giờ xem sếch, vui lòng liên hệ Admin!")
-                except Exception as e:
-                    logger.error(f"Lỗi khi gỡ role {role_name} cho user {user_id}: {e}")
+                else:
+                    # Kiểm tra thời gian còn lại mới
+                    new_expiration_time = new_record["expiration_time"]
+                    new_remaining = new_expiration_time - datetime.utcnow()
+                    new_duration = new_remaining.total_seconds()
+                    if new_duration > 5 * 24 * 3600:  # > 5 ngày
+                        # Bỏ qua, không xóa
+                        logger.info(f"Task xóa role cho {user_id} bị bỏ qua vì còn {new_duration / (24*3600):.1f} ngày")
+                        return
+                    else:
+                        # Tạo task mới để theo dõi nếu <= 5 ngày
+                        asyncio.create_task(remove_role_after_delay(member, role, user_id, role_name))
+                        logger.info(f"Tạo task mới cho {user_id} vì còn {new_duration / (24*3600):.1f} ngày")
+        else:
+            # Không có record, không làm gì
+            pass
     except Exception as e:
         logger.error(f"Lỗi khi xử lý task gỡ role {role_name} cho user {user_id}: {e}")
 
@@ -101,7 +132,28 @@ async def on_ready():
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ["Admin", "Mod", "Friendly Dev"]))
-async def giahan(ctx):
+async def giahan(ctx, *args):
+    # Parse số ngày từ invoked_with (ví dụ 'giahan' hoặc 'giahan100')
+    command_name = ctx.invoked_with.lower()
+    if command_name == 'giahan':
+        days = 50
+    else:
+        # Cố gắng lấy số sau 'giahan'
+        match = re.match(r'giahan(\d+)', command_name)
+        if match:
+            try:
+                days = int(match.group(1))
+                if days <= 0:
+                    await ctx.send(f"{ctx.author.mention}, số ngày phải lớn hơn 0!")
+                    return
+            except ValueError:
+                await ctx.send(f"{ctx.author.mention}, định dạng lệnh không hợp lệ! Sử dụng $giahan hoặc $giahanX (X là số ngày).")
+                return
+        else:
+            await ctx.send(f"{ctx.author.mention}, định dạng lệnh không hợp lệ! Sử dụng $giahan hoặc $giahanX (X là số ngày).")
+            return
+
+    # Kiểm tra mention
     if len(ctx.message.mentions) != 1:
         await ctx.send(f"{ctx.author.mention}, vui lòng mention đúng một người!")
         return
@@ -124,7 +176,7 @@ async def giahan(ctx):
     record = role_timers_collection.find_one({"user_id": user.id, "role_name": role_name})
     if record and record["expiration_time"] > set_time:
         # Người dùng đã có role và còn thời gian
-        new_expiration_time = record["expiration_time"] + timedelta(days=50)
+        new_expiration_time = record["expiration_time"] + timedelta(days=days)
         role_timers_collection.update_one(
             {"user_id": user.id, "role_name": role_name},
             {"$set": {
@@ -141,7 +193,7 @@ async def giahan(ctx):
             "action": "gia_han"
         })
         remaining_time = format_remaining_time(new_expiration_time)
-        await ctx.send(f"{user.mention}, thời gian bạn có thể xem sếch đã được gia hạn thêm 50 ngày, còn {remaining_time}!")
+        await ctx.send(f"{user.mention}, thời gian bạn có thể xem sếch đã được gia hạn thêm {days} ngày, còn {remaining_time}!")
         notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
         if notification_channel:
             await notification_channel.send(
@@ -157,7 +209,7 @@ async def giahan(ctx):
             logger.error(f"Lỗi khi cấp role {role_name} cho {user.id}: {e}")
             await ctx.send(f"{ctx.author.mention}, không thể cấp role {role_name} cho {user.mention} do lỗi: {str(e)}")
             return
-        expiration_time = set_time + timedelta(days=50)
+        expiration_time = set_time + timedelta(days=days)
         role_timers_collection.update_one(
             {"user_id": user.id, "role_name": role_name},
             {"$set": {
@@ -176,7 +228,7 @@ async def giahan(ctx):
             "action": "cap_moi"
         })
         remaining_time = format_remaining_time(expiration_time)
-        await ctx.send(f"{user.mention}, bạn đã được cấp quyền xem sếch trong 50 ngày!")
+        await ctx.send(f"{user.mention}, bạn đã được cấp quyền xem sếch trong {days} ngày!")
         notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
         if notification_channel:
             await notification_channel.send(
@@ -304,3 +356,4 @@ async def on_command_error(ctx, error):
 
 # Chạy bot
 bot.run(DISCORD_TOKEN)
+
