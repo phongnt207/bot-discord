@@ -5,7 +5,6 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 import logging
 import asyncio
-import re
 from dotenv import load_dotenv
 
 # Cấu hình logging
@@ -65,17 +64,15 @@ def format_remaining_time(expiration_time):
     minutes = int((total_seconds % 3600) // 60)
     return f"{months} tháng {days} ngày {hours} giờ {minutes} phút"
 
-# Hàm xóa role sau thời gian hết hạn (cập nhật với logic kiểm tra mới)
+# Hàm xóa role sau thời gian hết hạn
 async def remove_role_after_delay(member, role, user_id, role_name):
     try:
-        # Kiểm tra ngay lập tức
         record = role_timers_collection.find_one({"user_id": user_id, "role_name": role_name})
         if record:
             expiration_time = record["expiration_time"]
             remaining = expiration_time - datetime.utcnow()
             duration = remaining.total_seconds()
             if duration <= 0:
-                # Hết hạn ngay, xóa
                 await member.remove_roles(role)
                 role_timers_collection.delete_one({"user_id": user_id, "role_name": role_name})
                 channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
@@ -83,33 +80,25 @@ async def remove_role_after_delay(member, role, user_id, role_name):
                     await channel.send(f"{member.mention}, bạn đã hết giờ xem sếch, vui lòng liên hệ Admin!")
                 return
             else:
-                # Sleep đến hết hạn
                 await asyncio.sleep(duration)
-                
-                # Sau sleep, kiểm tra lại DB
                 new_record = role_timers_collection.find_one({"user_id": user_id, "role_name": role_name})
                 if not new_record or new_record["expiration_time"] <= datetime.utcnow():
-                    # Vẫn hết hạn, xóa
                     await member.remove_roles(role)
                     role_timers_collection.delete_one({"user_id": user_id, "role_name": role_name})
                     channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
                     if channel:
                         await channel.send(f"{member.mention}, bạn đã hết giờ xem sếch, vui lòng liên hệ Admin!")
                 else:
-                    # Kiểm tra thời gian còn lại mới
                     new_expiration_time = new_record["expiration_time"]
                     new_remaining = new_expiration_time - datetime.utcnow()
                     new_duration = new_remaining.total_seconds()
                     if new_duration > 5 * 24 * 3600:  # > 5 ngày
-                        # Bỏ qua, không xóa
                         logger.info(f"Task xóa role cho {user_id} bị bỏ qua vì còn {new_duration / (24*3600):.1f} ngày")
                         return
                     else:
-                        # Tạo task mới để theo dõi nếu <= 5 ngày
                         asyncio.create_task(remove_role_after_delay(member, role, user_id, role_name))
                         logger.info(f"Tạo task mới cho {user_id} vì còn {new_duration / (24*3600):.1f} ngày")
         else:
-            # Không có record, không làm gì
             pass
     except Exception as e:
         logger.error(f"Lỗi khi xử lý task gỡ role {role_name} cho user {user_id}: {e}")
@@ -117,13 +106,18 @@ async def remove_role_after_delay(member, role, user_id, role_name):
 @bot.event
 async def on_ready():
     logger.info(f"Bot đã sẵn sàng với tên {bot.user}")
-    # Khôi phục các task gỡ role từ MongoDB
+    guild = bot.guilds[0]
+    role = discord.utils.get(guild.roles, name=role_mapping[TIMED_ROLE_KEY])
+    if not role:
+        logger.error(f"Role {role_mapping[TIMED_ROLE_KEY]} không tồn tại trong server!")
+    notification_channel = bot.get_channel(ROLE_NOTIFICATION_CHANNEL_ID)
+    if not notification_channel:
+        logger.error("Kênh thông báo không tồn tại hoặc bot không có quyền truy cập!")
     for record in role_timers_collection.find():
         user_id = record["user_id"]
         role_name = record["role_name"]
         expiration_time = record["expiration_time"]
         if expiration_time > datetime.utcnow():
-            guild = bot.guilds[0]
             member = guild.get_member(user_id)
             role = discord.utils.get(guild.roles, name=role_name)
             if member and role and role in member.roles:
@@ -132,42 +126,18 @@ async def on_ready():
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ["Admin", "Mod", "Friendly Dev"]))
-async def giahan(ctx, *args):
-    # Parse số ngày từ invoked_with (ví dụ 'giahan' hoặc 'giahan100')
-    command_name = ctx.invoked_with.lower()
-    if command_name == 'giahan':
-        days = 50
-    else:
-        # Cố gắng lấy số sau 'giahan'
-        match = re.match(r'giahan(\d+)', command_name)
-        if match:
-            try:
-                days = int(match.group(1))
-                if days <= 0:
-                    await ctx.send(f"{ctx.author.mention}, số ngày phải lớn hơn 0!")
-                    return
-            except ValueError:
-                await ctx.send(f"{ctx.author.mention}, định dạng lệnh không hợp lệ! Sử dụng $giahan hoặc $giahanX (X là số ngày).")
-                return
-        else:
-            await ctx.send(f"{ctx.author.mention}, định dạng lệnh không hợp lệ! Sử dụng $giahan hoặc $giahanX (X là số ngày).")
-            return
-
-    # Kiểm tra mention
-    if len(ctx.message.mentions) != 1:
-        await ctx.send(f"{ctx.author.mention}, vui lòng mention đúng một người!")
+async def giahan(ctx, user: discord.Member, days: int = 50):
+    if days <= 0:
+        await ctx.send(f"{ctx.author.mention}, số ngày phải lớn hơn 0!")
         return
-    user = ctx.message.mentions[0]
     role_name = role_mapping[TIMED_ROLE_KEY]
     role = discord.utils.get(ctx.guild.roles, name=role_name)
     if not role:
         await ctx.send(f"{ctx.author.mention}, role {role_name} chưa được tạo, vui lòng nhờ Admin tạo role!")
         return
-    # Kiểm tra quyền Manage Roles của bot
     if not ctx.guild.me.guild_permissions.manage_roles:
         await ctx.send(f"{ctx.author.mention}, bot không có quyền Manage Roles! Vui lòng cấp quyền cho bot.")
         return
-    # Kiểm tra thứ tự role
     if role.position >= ctx.guild.me.top_role.position:
         await ctx.send(f"{ctx.author.mention}, role {role_name} có thứ tự cao hơn role của bot! Vui lòng điều chỉnh thứ tự role.")
         return
@@ -175,7 +145,6 @@ async def giahan(ctx, *args):
     set_time = datetime.utcnow()
     record = role_timers_collection.find_one({"user_id": user.id, "role_name": role_name})
     if record and record["expiration_time"] > set_time:
-        # Người dùng đã có role và còn thời gian
         new_expiration_time = record["expiration_time"] + timedelta(days=days)
         role_timers_collection.update_one(
             {"user_id": user.id, "role_name": role_name},
@@ -184,7 +153,6 @@ async def giahan(ctx, *args):
                 "last_notified": None
             }}
         )
-        # Lưu lịch sử gia hạn
         role_history_collection.insert_one({
             "user_id": user.id,
             "role_name": role_name,
@@ -201,7 +169,6 @@ async def giahan(ctx, *args):
                 f"với thời gian còn lại là {remaining_time}"
             )
     else:
-        # Người dùng chưa có role hoặc role đã hết hạn
         try:
             await user.add_roles(role)
             logger.info(f"Đã cấp role {role_name} cho {user.id}")
@@ -219,7 +186,6 @@ async def giahan(ctx, *args):
             }},
             upsert=True
         )
-        # Lưu lịch sử gia hạn
         role_history_collection.insert_one({
             "user_id": user.id,
             "role_name": role_name,
@@ -236,26 +202,19 @@ async def giahan(ctx, *args):
                 f"với thời gian còn lại là {remaining_time}"
             )
 
-    # Tạo task gỡ role
     asyncio.create_task(remove_role_after_delay(user, role, user.id, role_name))
 
 @bot.command()
 @commands.check(lambda ctx: has_role(ctx.author, ["Admin", "Mod", "Friendly Dev"]))
-async def rm(ctx):
-    if len(ctx.message.mentions) != 1:
-        await ctx.send(f"{ctx.author.mention}, vui lòng mention đúng một người!")
-        return
-    user = ctx.message.mentions[0]
+async def rm(ctx, user: discord.Member):
     role_name = role_mapping[TIMED_ROLE_KEY]
     role = discord.utils.get(ctx.guild.roles, name=role_name)
     if not role:
         await ctx.send(f"{ctx.author.mention}, role {role_name} chưa được tạo, vui lòng nhờ Admin tạo role!")
         return
-    # Kiểm tra quyền Manage Roles của bot
     if not ctx.guild.me.guild_permissions.manage_roles:
         await ctx.send(f"{ctx.author.mention}, bot không có quyền Manage Roles! Vui lòng cấp quyền cho bot.")
         return
-    # Kiểm tra thứ tự role
     if role.position >= ctx.guild.me.top_role.position:
         await ctx.send(f"{ctx.author.mention}, role {role_name} có thứ tự cao hơn role của bot! Vui lòng điều chỉnh thứ tự role.")
         return
@@ -350,10 +309,11 @@ async def on_command_error(ctx, error):
         await ctx.send(f"{ctx.author.mention}, bạn không có quyền sử dụng lệnh này!")
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send(f"{ctx.author.mention}, không tìm thấy người dùng! Vui lòng mention một người dùng hợp lệ (ví dụ: @user).")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"{ctx.author.mention}, định dạng tham số không hợp lệ! Vui lòng sử dụng cú pháp: $giahan @user [số ngày].")
     else:
         logger.error(f"Lỗi lệnh: {error}")
         await ctx.send(f"{ctx.author.mention}, có lỗi xảy ra: {str(error)}. Vui lòng liên hệ Admin.")
 
 # Chạy bot
 bot.run(DISCORD_TOKEN)
-
